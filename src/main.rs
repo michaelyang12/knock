@@ -7,20 +7,18 @@ use std::process::Command;
 use std::process::Stdio;
 
 use crate::args::Args;
-use crate::client::OpenAIClient;
+use crate::client::RequestClient;
 use clap::Parser;
 use colored::*;
 
 #[tokio::main]
 async fn main() {
-    let client = OpenAIClient::new();
     let args = Args::parse();
-    let prompt = OpenAIClient::gen_prompt(&args);
-    let res = client
-        .send_prompt(&prompt)
+    let res = RequestClient::new(args.clone())
+        .make_request()
         .await
         .expect("Error getting response");
-    println!("{}", &res.bright_cyan());
+    println!("{}", &res.bright_green());
     if !(&args.verbose) {
         copy_to_clipboard(&res).expect("Error copying to clipboard");
         // println!("{}", "result copied to clipboard!".red());
