@@ -1,7 +1,6 @@
 use crate::args::Args;
 use crate::config;
 use openai_api_rust::chat::*;
-use openai_api_rust::completions::*;
 use openai_api_rust::*;
 
 const INSTRUCTIONS: &str = "\
@@ -20,9 +19,9 @@ const INSTRUCTIONS: &str = "\
     1. Assume the user is on macOS unless specified otherwise.
     2. Only use standard CLI tools and widely-accepted options.
     3. Output exactly one copy-paste-ready command, unless the verbose flag is explicitly provided.
-    4. If the input contains '>' or '<verbose flag on>', output exactly 5 options in this table format:
-        1) <command padded to 40 chars> | <explanation padded to 50 chars> | <confidence%>
-        Columns must be aligned exactly; do not add extra text.
+    4. If the input contains '[verbose]', output exactly 5 options in this table format:
+        1) <command> | <explanation padded to exactly 50 chars total> | <confidence in %>
+        Columns must be aligned exactly (unless command is very long); Never add extra text in explanation.
     5. When verbose mode is used, the top option must match exactly what would have been output without verbose.
     6. Do not provide explanations or extra text outside the table unless verbose mode is enabled.
     7. If unsure about a command, return a clear “command unknown” placeholder instead of guessing.
@@ -43,34 +42,27 @@ const INSTRUCTIONS: &str = "\
 
 Input: ";
 
-pub struct Client {
-    auth: Auth,
-    openai: OpenAI,
+pub struct OpenAIClient {
+    client: OpenAI,
 }
 
-struct Prompt {
-    instructions: String,
-    input: String,
-}
-
-impl Client {
+impl OpenAIClient {
     pub fn new() -> Self {
         let key = config::init();
         let auth = Auth::new(&key);
-        let openai = OpenAI::new(auth.clone(), "https://api.openai.com/v1/");
-        Self { auth, openai }
-    }
-    pub fn gen_prompt(args: impl Into<Args>) -> String {
-        let args = args.into();
-        let base_prompt = args.input;
-        if args.verbose {
-            format!("{}{}{}", INSTRUCTIONS, base_prompt, " > <verbose flag on>")
-        } else {
-            format!("{}{}", INSTRUCTIONS, base_prompt)
-        }
+        let client = OpenAI::new(auth.clone(), "https://api.openai.com/v1/");
+        Self { client }
     }
 
-    pub fn send_prompt(&self, prompt: &str) -> Result<String, Error> {
+    pub fn gen_prompt(args: &Args) -> String {
+        let mut prompt_parts = vec![INSTRUCTIONS, &args.input];
+        if args.verbose {
+            prompt_parts.push(" [verbose]")
+        }
+        prompt_parts.join("")
+    }
+
+    pub async fn send_prompt(&self, prompt: &str) -> Result<String, Error> {
         let body = ChatBody {
             model: "gpt-4.1".into(),
             max_tokens: Some(300),
@@ -89,7 +81,7 @@ impl Client {
             }],
         };
 
-        let rs = self.openai.chat_completion_create(&body)?;
+        let rs = self.client.chat_completion_create(&body)?;
 
         let choice = rs
             .choices
