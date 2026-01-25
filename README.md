@@ -1,6 +1,6 @@
 # knock
 
-A CLI command helper written in Rust. Describe what you want in plain English, get the shell command back.
+A CLI command helper written in Rust. Describe a command you need, get the shell command back.
 
     kn "find all large files over 500MB"
     → find . -type f -size +500M
