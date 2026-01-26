@@ -27,7 +27,7 @@ impl Cache {
         let _ = self.db.insert(key, response.as_bytes());
     }
 
-    pub fn generate_key(query: &str, os: &str, shell: &str, verbose: bool) -> String {
+    pub fn generate_key(query: &str, os: &str, shell: &str, mode: &str) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -35,7 +35,7 @@ impl Cache {
         query.hash(&mut hasher);
         os.hash(&mut hasher);
         shell.hash(&mut hasher);
-        verbose.hash(&mut hasher);
+        mode.hash(&mut hasher);
         format!("{:x}", hasher.finish())
     }
 }

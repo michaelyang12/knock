@@ -9,9 +9,9 @@ mod setup;
 use std::io::{self, BufRead, Write};
 use std::process::{Command, Stdio};
 
-use crate::args::Args;
+use crate::args::{Args, Commands};
 use crate::cache::Cache;
-use crate::client::RequestClient;
+use crate::client::{RequestClient, RequestMode};
 use crate::config::Config;
 use crate::context::ShellContext;
 use crate::history::History;
@@ -37,21 +37,43 @@ async fn main() {
         return;
     }
 
+    // Handle explain subcommand
+    if let Some(Commands::Explain { command }) = &args.command {
+        explain_command(command, &args).await;
+        return;
+    }
+
     if args.input.is_empty() {
         eprintln!("{}", "Error: Please provide a query".red());
         std::process::exit(1);
     }
 
+    // Determine request mode
+    let mode = if args.alt {
+        RequestMode::Alt
+    } else if args.verbose {
+        RequestMode::Verbose
+    } else {
+        RequestMode::Standard
+    };
+
+    let mode_str = match mode {
+        RequestMode::Standard => "standard",
+        RequestMode::Verbose => "verbose",
+        RequestMode::Alt => "alt",
+        RequestMode::Explain => "explain",
+    };
+
     let context = ShellContext::detect();
     let config = Config::load();
-    let cache_key = Cache::generate_key(&args.input, &context.os, &context.shell, args.verbose);
+    let cache_key = Cache::generate_key(&args.input, &context.os, &context.shell, mode_str);
     let cache = Cache::load();
 
     let res = if let Some(cached) = cache.get(&cache_key) {
         cached
     } else {
         let response = RequestClient::new(args.clone(), context, config)
-            .make_request()
+            .make_request(mode)
             .await
             .expect("Error getting response");
 
@@ -59,13 +81,45 @@ async fn main() {
         response
     };
 
-    // Save to history
-    let history = History::load();
-    history.add(args.input.clone(), res.clone());
+    // Save to history (only for standard/verbose, not alt)
+    if !args.alt {
+        let history = History::load();
+        // For verbose mode, extract just the command (first line) for history
+        let cmd_for_history = if args.verbose {
+            res.lines().next().unwrap_or(&res).to_string()
+        } else {
+            res.clone()
+        };
+        history.add(args.input.clone(), cmd_for_history);
+    }
 
-    println!("{}", &res.bright_green());
+    // Display result
+    if args.verbose {
+        // Verbose: command on first line, explanation below
+        let mut lines = res.lines();
+        if let Some(cmd) = lines.next() {
+            println!("{}", cmd.bright_green());
+            // Copy just the command to clipboard
+            copy_to_clipboard(cmd).expect("Error copying to clipboard");
+            // Print remaining lines (explanation) in dimmed style
+            let explanation: String = lines.collect::<Vec<_>>().join("\n");
+            if !explanation.trim().is_empty() {
+                println!("{}", explanation.trim().dimmed());
+            }
+        }
+    } else {
+        println!("{}", &res.bright_green());
+        if !args.alt {
+            copy_to_clipboard(&res).expect("Error copying to clipboard");
+        }
+    }
 
-    if args.execute {
+    if args.execute && !args.alt {
+        let cmd = if args.verbose {
+            res.lines().next().unwrap_or(&res)
+        } else {
+            &res
+        };
         print!("{}", "Execute? [y/N] ".yellow());
         io::stdout().flush().unwrap();
 
@@ -74,11 +128,36 @@ async fn main() {
 
         if input.trim().eq_ignore_ascii_case("y") {
             println!("{}", "---".dimmed());
-            execute_command(&res);
+            execute_command(cmd);
         }
-    } else if !args.verbose {
-        copy_to_clipboard(&res).expect("Error copying to clipboard");
     }
+}
+
+async fn explain_command(command: &str, args: &Args) {
+    let context = ShellContext::detect();
+    let config = Config::load();
+    let cache_key = Cache::generate_key(command, &context.os, &context.shell, "explain");
+    let cache = Cache::load();
+
+    let res = if let Some(cached) = cache.get(&cache_key) {
+        cached
+    } else {
+        // Create a modified args with the command as input
+        let mut explain_args = args.clone();
+        explain_args.input = command.to_string();
+
+        let response = RequestClient::new(explain_args, context, config)
+            .make_request(RequestMode::Explain)
+            .await
+            .expect("Error getting response");
+
+        cache.insert(cache_key, response.clone());
+        response
+    };
+
+    println!("{}", command.bright_green());
+    println!();
+    println!("{}", res);
 }
 
 fn show_history(filter: &str) {

@@ -13,7 +13,7 @@ const INSTRUCTIONS: &str = r#"
   </role>
 
   <output_format>
-    Return ONLY the command(s) needed. No explanations, no markdown, no preamble unless verbose mode is enabled.
+    Return ONLY the command(s) needed. No explanations, no markdown, no preamble unless a special mode is enabled.
   </output_format>
 
   <command_chaining>
@@ -26,7 +26,11 @@ const INSTRUCTIONS: &str = r#"
     </mode>
 
     <mode name="verbose">
-      When [verbose] flag is present, return:
+      When [verbose] flag is present, return the command on the first line, then a blank line, then a brief explanation (2-3 sentences) of what the command does and why any flags/options are used.
+    </mode>
+
+    <mode name="alt">
+      When [alt] flag is present, return:
       PRIMARY: main command
       ALTERNATIVES: 2-3 alternatives with brief explanations
       OPTIONS: relevant flags that modify behavior
@@ -46,10 +50,47 @@ const INSTRUCTIONS: &str = r#"
 </system_instructions>
 "#;
 
+const EXPLAIN_INSTRUCTIONS: &str = r#"
+<system_instructions>
+  <role>
+    You are a command-line expert. Explain what shell commands do in clear, concise terms.
+  </role>
+
+  <output_format>
+    Provide a clear explanation of the command:
+    1. Start with a one-sentence summary of what the command does
+    2. Break down each part: the base command, flags/options, and arguments
+    3. Mention any important side effects or gotchas
+    Keep it concise but thorough.
+  </output_format>
+
+  <invalid_commands>
+    If the input is not a valid or recognizable shell command, respond with exactly:
+    Invalid command.
+    Do not elaborate or explain why it's invalid.
+  </invalid_commands>
+
+  <constraints>
+    Don't suggest alternatives or improvements unless the command is dangerous.
+    Focus on explaining what the given command does, not what else could be done.
+    Use the provided OS and shell context to give accurate, platform-specific details.
+  </constraints>
+</system_instructions>
+"#;
+
 pub struct RequestClient {
     args: Args,
     context: ShellContext,
     config: Config,
+}
+
+/// The type of request being made
+#[derive(Clone, Copy)]
+pub enum RequestMode {
+    Standard,
+    Verbose,
+    Alt,
+    Explain,
 }
 
 impl RequestClient {
@@ -57,33 +98,52 @@ impl RequestClient {
         Self { args, context, config }
     }
 
-    fn gen_prompt(&self) -> String {
-        let verbose_tag = if self.args.verbose { " [verbose]" } else { "" };
+    fn gen_prompt(&self, mode: RequestMode) -> String {
+        let mode_tag = match mode {
+            RequestMode::Standard => "",
+            RequestMode::Verbose => " [verbose]",
+            RequestMode::Alt => " [alt]",
+            RequestMode::Explain => "",
+        };
         format!(
             "{}\n\n<request>{}{}</request>",
             self.context.as_prompt_context(),
             self.args.input,
-            verbose_tag
+            mode_tag
         )
     }
 
-    pub async fn make_request(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        match self.config.provider {
-            Provider::OpenAI => self.request_openai().await,
-            Provider::Anthropic => self.request_anthropic().await,
-            Provider::Ollama => self.request_ollama().await,
+    fn get_instructions(mode: RequestMode) -> &'static str {
+        match mode {
+            RequestMode::Explain => EXPLAIN_INSTRUCTIONS,
+            _ => INSTRUCTIONS,
         }
     }
 
-    async fn request_openai(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    fn get_max_tokens(&self, mode: RequestMode) -> u32 {
+        match mode {
+            RequestMode::Standard => 256,
+            RequestMode::Verbose | RequestMode::Alt | RequestMode::Explain => 512,
+        }
+    }
+
+    pub async fn make_request(&self, mode: RequestMode) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        match self.config.provider {
+            Provider::OpenAI => self.request_openai(mode).await,
+            Provider::Anthropic => self.request_anthropic(mode).await,
+            Provider::Ollama => self.request_ollama(mode).await,
+        }
+    }
+
+    async fn request_openai(&self, mode: RequestMode) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let client: Client<OpenAIConfig> = Client::new();
-        let prompt = self.gen_prompt();
+        let prompt = self.gen_prompt(mode);
         let request = CreateResponseArgs::default()
             .model(self.config.openai_model())
-            .instructions(INSTRUCTIONS)
+            .instructions(Self::get_instructions(mode))
             .input(prompt)
             .temperature(0.2)
-            .max_output_tokens(if self.args.verbose { 512u32 } else { 256u32 })
+            .max_output_tokens(self.get_max_tokens(mode))
             .build()?;
 
         let response = client.responses().create(request).await?;
@@ -95,16 +155,16 @@ impl RequestClient {
         }
     }
 
-    async fn request_anthropic(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn request_anthropic(&self, mode: RequestMode) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| "ANTHROPIC_API_KEY not set")?;
 
-        let prompt = self.gen_prompt();
+        let prompt = self.gen_prompt(mode);
 
         let request_body = AnthropicRequest {
             model: self.config.anthropic_model().to_string(),
-            max_tokens: if self.args.verbose { 512 } else { 256 },
-            system: INSTRUCTIONS.to_string(),
+            max_tokens: self.get_max_tokens(mode),
+            system: Self::get_instructions(mode).to_string(),
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: prompt,
@@ -135,8 +195,8 @@ impl RequestClient {
             .ok_or_else(|| "Empty response from Anthropic".into())
     }
 
-    async fn request_ollama(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let prompt = self.gen_prompt();
+    async fn request_ollama(&self, mode: RequestMode) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let prompt = self.gen_prompt(mode);
         let url = format!("{}/api/chat", self.config.ollama_url());
 
         let request_body = OllamaRequest {
@@ -144,7 +204,7 @@ impl RequestClient {
             messages: vec![
                 OllamaMessage {
                     role: "system".to_string(),
-                    content: INSTRUCTIONS.to_string(),
+                    content: Self::get_instructions(mode).to_string(),
                 },
                 OllamaMessage {
                     role: "user".to_string(),
@@ -154,7 +214,7 @@ impl RequestClient {
             stream: false,
             options: OllamaOptions {
                 temperature: 0.2,
-                num_predict: if self.args.verbose { 512 } else { 256 },
+                num_predict: self.get_max_tokens(mode),
             },
         };
 
