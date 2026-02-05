@@ -256,6 +256,7 @@ dependencies = [
 [[package]]
 name = "conduit"
 version = "0.1.0"
+source = "git+https://github.com/michaelyang12/conduit.git#d144ab19ae14361030a491b480ab91d124f40870"
 dependencies = [
  "async-openai",
  "colored",
@@ -936,7 +937,7 @@ dependencies = [
 
 [[package]]
 name = "knock"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "clap",
  "clipboard",
