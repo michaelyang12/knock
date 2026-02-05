@@ -254,6 +254,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "conduit"
+version = "0.1.0"
+dependencies = [
+ "async-openai",
+ "colored",
+ "dotenvy",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -925,12 +938,10 @@ dependencies = [
 name = "knock"
 version = "0.2.2"
 dependencies = [
- "async-openai",
  "clap",
  "clipboard",
  "colored",
- "dotenvy",
- "reqwest",
+ "conduit",
  "serde",
  "serde_json",
  "sled",
