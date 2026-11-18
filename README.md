@@ -22,7 +22,7 @@ This installs `kn` into `~/.cargo/bin`. Upgrade later with `kn --upgrade`.
 kn --config
 ```
 
-Choose a provider and model. The model list is fetched live, and setup ends with a test prompt. Supported providers include:
+Choose a provider and model: each provider shows whether it is ready, models are listed live, and Esc goes back a step. Supported providers include:
 
 | Provider | Needs |
 |---|---|
