@@ -212,6 +212,7 @@ dependencies = [
 [[package]]
 name = "conduit"
 version = "0.2.0"
+source = "git+https://github.com/michaelyang12/conduit.git#d3591a5920b31eb10f91d6808c4aeca542fea4bf"
 dependencies = [
  "console",
  "inquire",

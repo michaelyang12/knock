@@ -15,7 +15,7 @@ cargo run -- --provider claude-code --model haiku --no-copy list files   # live 
 
 Before finishing any change, run: `cargo fmt && cargo clippy --all-targets && cargo test`
 
-`Cargo.toml` has a `[patch]` that points conduit at `../conduit`. Remove it once the conduit changes are pushed; a plain `cargo install --git` ignores it either way.
+conduit comes from git (`main`), pinned in `Cargo.lock`. To pick up a new conduit commit: `cargo update -p conduit`. To develop against a local checkout, add a `[patch."https://github.com/michaelyang12/conduit.git"]` section pointing at `../conduit`, and remove it before pushing: a `cargo install --git` (and `kn --upgrade`) would look for `../conduit` and fail.
 
 ## Layout
 
