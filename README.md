@@ -1,105 +1,86 @@
 # knock
 
-A CLI command helper written in Rust. Describe a command you need, get the shell command back.
+Describe a shell command in plain language, get the command back.
 
-    kn "find all large files over 500MB"
-    → find . -type f -size +500M
+```console
+$ kn find files over 500MB here
+find . -type f -size +500M
+copied to clipboard
+```
 
----
+## Install
 
-## Installation
+```sh
+cargo install --git https://github.com/michaelyang12/knock.git --locked
+```
 
-Requires Rust and Cargo.
-
-    cargo install --git https://github.com/michaelyang12/knock.git --locked
-
-This installs the `kn` binary into ~/.cargo/bin
-
----
+This installs `kn` into `~/.cargo/bin`. Upgrade later with `kn --upgrade`.
 
 ## Setup
 
-Run the interactive setup to configure your provider and model:
-
-    kn --config
-
-Or manually set your API key in your shell profile (.bashrc, .zshrc, etc.):
-
-```bash
-# OpenAI (default)
-export OPENAI_API_KEY="your_key_here"
-
-# Anthropic
-export ANTHROPIC_API_KEY="your_key_here"
-
-# Ollama - no API key needed (runs locally)
+```sh
+kn --config
 ```
 
----
+Choose a provider and model. The model list is fetched live, and setup ends with a test prompt. Supported providers include:
+
+| Provider | Needs |
+|---|---|
+| OpenAI, Anthropic, Gemini, Groq, OpenRouter, DeepSeek | the provider's API key in your environment, e.g. `OPENAI_API_KEY` |
+| Claude Code, Codex | the `claude` / `codex` CLI, signed in (subscriptions work) |
+| Ollama, LM Studio | the local server running |
+| Any OpenAI-compatible server | its URL |
+
+Config lives in `~/.config/conduit/knock/config.toml`. LLM access goes through [conduit](https://github.com/michaelyang12/conduit), which documents the config format.
 
 ## Usage
 
-    kn "undo last git commit but keep changes"     # basic query
-    kn -v "list docker containers"                 # verbose (alternatives + options)
-    kn -x "delete node_modules"                    # execute with confirmation
-    kn --history                                   # show recent history
-    kn --history "git"                             # search history
-    kn --config                                    # configure provider/model
-    kn --upgrade                                   # upgrade to latest version
-
----
-
-## Configuration
-
-Run `kn --config` for interactive setup, or create `~/.knock/config.json` manually:
-
-**Supported providers:**
-
-| Provider | Env Variable | Default Model |
-|----------|--------------|---------------|
-| `openai` | `OPENAI_API_KEY` | `gpt-4o-mini` |
-| `anthropic` | `ANTHROPIC_API_KEY` | `claude-sonnet-4-20250514` |
-| `ollama` | None (local) | `llama3.2` |
-
-**Example configs:**
-
-```json
-// Use Claude
-{ "provider": "anthropic" }
-
-// Use GPT-5.1
-{ "openai_model": "gpt-5.1" }
-
-// Use Ollama locally (free, private)
-{ "provider": "ollama" }
-
-// Use Ollama with a specific model
-{ "provider": "ollama", "ollama_model": "mistral" }
-
-// Use Ollama on a different host
-{ "provider": "ollama", "ollama_url": "http://192.168.1.100:11434" }
+```sh
+kn undo my last commit but keep the changes     # quotes optional
+kn -v list docker containers                    # explain the command
+kn -a compress this folder                      # alternatives
+kn -x delete node_modules everywhere            # run it after confirming
+kn explain tar -xzvf archive.tgz                # explain an existing command
+cargo build 2>&1 | kn fix this                  # piped output becomes context
+kn --history                                    # recent commands
+kn --history git                                # search history
 ```
 
----
+| Flag | |
+|---|---|
+| `-v`, `--verbose` | explain the command |
+| `-a`, `--alt` | show alternatives |
+| `-x`, `--execute` | run it after a `[y/N]` confirmation |
+| `-f`, `--fresh` | skip the cache |
+| `--provider NAME`, `--model NAME` | override the provider or model for one run |
+| `--no-copy` | don't copy to the clipboard |
+| `--raw` | print only the command (also the default when output is piped) |
+
+Put flags before `explain`: anything after it is treated as the command to explain.
+
+Commands that delete data, need `sudo`, rewrite git history and so on get a red warning. With `-x` they ask "Run it anyway?". Both the model and a local pattern check can flag a command.
+
+## Shell integration
+
+Put generated commands straight onto your prompt line, ready to edit, instead of only on the clipboard:
+
+```sh
+eval "$(kn --init zsh)"     # ~/.zshrc
+eval "$(kn --init bash)"    # ~/.bashrc (bash 4+)
+kn --init fish | source     # ~/.config/fish/config.fish
+```
+
+With integration on, `kn <query>` fills your next prompt. Calls that start with a flag, and `kn explain`, behave as before.
 
 ## Data
 
-knock stores data in `~/.knock/`:
+```text
+~/.knock/
+├── cache.json     # answers per query, provider and model, kept 30 days
+└── history.json   # last 200 commands
+```
 
-    ~/.knock/
-    ├── config.json    # settings
-    ├── cache/         # query cache (sled db)
-    └── history/       # command history (sled db)
-
----
-
-## Upgrade
-
-Update to the latest version:
-
-    kn --upgrade
-
----
+Both files are optional and safe to delete. knock 0.2 kept this data in sled databases (`~/.knock/cache/`, `~/.knock/history/`); 0.3 doesn't read them, so you can delete those folders too.
 
 ## License
 

@@ -1,394 +1,228 @@
 mod args;
-mod cache;
 mod context;
-mod history;
+mod danger;
+mod llm;
+mod shell;
+mod store;
+mod ui;
+mod upgrade;
 
-use std::io::{self, BufRead, Write};
-use std::process::{Command, Stdio};
-
-use crate::args::{Args, Commands};
-use crate::cache::Cache;
+use crate::args::{Args, Command};
 use crate::context::ShellContext;
-use crate::history::History;
+use crate::llm::{APP, Mode, Suggestion};
+use crate::store::{Cache, History};
+use crate::ui::Spinner;
 use clap::Parser;
-use colored::*;
-use conduit::{Config, RequestOptions};
-
-const INSTRUCTIONS: &str = r#"
-<system_instructions>
-  <role>
-    You are a command-line translation assistant. Convert natural language into accurate, executable CLI commands.
-  </role>
-
-  <output_format>
-    Return ONLY the command(s) needed. No explanations, no markdown, no preamble unless a special mode is enabled.
-  </output_format>
-
-  <command_chaining>
-    Use appropriate operators: && (sequential), || (fallback), ; (independent), | (pipe)
-  </command_chaining>
-
-  <modes>
-    <mode name="standard" default="true">
-      Return the most direct, idiomatic command. Prioritize single-line solutions, common tools, and safe defaults.
-    </mode>
-
-    <mode name="verbose">
-      When [verbose] flag is present, return the command on the first line, then a blank line, then a brief explanation (2-3 sentences) of what the command does and why any flags/options are used.
-    </mode>
-
-    <mode name="alt">
-      When [alt] flag is present, return:
-      PRIMARY: main command
-      ALTERNATIVES: 2-3 alternatives with brief explanations
-      OPTIONS: relevant flags that modify behavior
-    </mode>
-  </modes>
-
-  <safety>
-    For destructive operations (rm, format, drop), include confirmation flags unless "force" is in the request.
-    For privilege escalation, prefix with sudo on Unix/Linux.
-  </safety>
-
-  <constraints>
-    Never include explanatory text in standard mode.
-    Don't ask clarifying questions; make reasonable assumptions.
-    Use the provided OS, shell, and cwd context to generate accurate commands.
-  </constraints>
-</system_instructions>
-"#;
-
-const EXPLAIN_INSTRUCTIONS: &str = r#"
-<system_instructions>
-  <role>
-    You are a command-line expert. Explain what shell commands do in clear, concise terms.
-  </role>
-
-  <output_format>
-    Provide a clear explanation of the command:
-    1. Start with a one-sentence summary of what the command does
-    2. Break down each part: the base command, flags/options, and arguments
-    3. Mention any important side effects or gotchas
-    Keep it concise but thorough.
-  </output_format>
-
-  <invalid_commands>
-    If the input is not a valid or recognizable shell command, respond with exactly:
-    Invalid command.
-    Do not elaborate or explain why it's invalid.
-  </invalid_commands>
-
-  <constraints>
-    Don't suggest alternatives or improvements unless the command is dangerous.
-    Focus on explaining what the given command does, not what else could be done.
-    Use the provided OS and shell context to give accurate, platform-specific details.
-  </constraints>
-</system_instructions>
-"#;
-
-/// The type of request being made
-#[derive(Clone, Copy)]
-enum RequestMode {
-    Standard,
-    Verbose,
-    Alt,
-    Explain,
-}
-
-fn gen_prompt(context: &ShellContext, input: &str, mode: RequestMode) -> String {
-    let mode_tag = match mode {
-        RequestMode::Standard => "",
-        RequestMode::Verbose => " [verbose]",
-        RequestMode::Alt => " [alt]",
-        RequestMode::Explain => "",
-    };
-    format!(
-        "{}\n\n<request>{}{}</request>",
-        context.as_prompt_context(),
-        input,
-        mode_tag
-    )
-}
-
-fn get_instructions(mode: RequestMode) -> &'static str {
-    match mode {
-        RequestMode::Explain => EXPLAIN_INSTRUCTIONS,
-        _ => INSTRUCTIONS,
-    }
-}
-
-fn get_max_tokens(mode: RequestMode) -> u32 {
-    match mode {
-        RequestMode::Standard => 256,
-        RequestMode::Verbose | RequestMode::Alt | RequestMode::Explain => 512,
-    }
-}
+use colored::Colorize;
+use conduit::Conduit;
+use std::io::IsTerminal;
+use std::process::ExitCode;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     let args = Args::parse();
+    if !std::io::stdout().is_terminal() && !std::io::stderr().is_terminal() {
+        colored::control::set_override(false);
+    }
 
+    if let Some(shell) = args.init {
+        print!("{}", shell::init_script(shell));
+        return ExitCode::SUCCESS;
+    }
     if args.upgrade {
-        upgrade();
-        return;
+        return upgrade::run();
     }
-
     if args.config {
-        conduit::setup::run_setup("knock", None);
-        return;
+        return match conduit::setup::run(APP).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => report(&e),
+        };
     }
-
     if args.history {
-        show_history(&args.input);
-        return;
+        show_history(&args.query());
+        return ExitCode::SUCCESS;
+    }
+    if let Some(Command::Explain { command }) = &args.command {
+        return explain(&args, &command.join(" ")).await;
     }
 
-    // Handle explain subcommand
-    if let Some(Commands::Explain { command }) = &args.command {
-        explain_command(command, &args).await;
-        return;
+    let query = args.query();
+    if query.is_empty() {
+        eprintln!("usage: kn <what you want to do>    (kn --help for more)");
+        return ExitCode::from(2);
     }
+    suggest(&args, &query).await
+}
 
-    if args.input.is_empty() {
-        eprintln!("{}", "Error: Please provide a query".red());
-        std::process::exit(1);
-    }
-
-    // Determine request mode
+async fn suggest(args: &Args, query: &str) -> ExitCode {
     let mode = if args.alt {
-        RequestMode::Alt
+        Mode::Alt
     } else if args.verbose {
-        RequestMode::Verbose
+        Mode::Verbose
     } else {
-        RequestMode::Standard
+        Mode::Standard
+    };
+    let piped = context::piped_input();
+    let ctx = ShellContext::detect();
+    let llm = match llm::connect(args.provider.as_deref(), args.model.as_deref()) {
+        Ok(llm) => llm,
+        Err(e) => return report(&e),
     };
 
-    let mode_str = match mode {
-        RequestMode::Standard => "standard",
-        RequestMode::Verbose => "verbose",
-        RequestMode::Alt => "alt",
-        RequestMode::Explain => "explain",
-    };
+    let dir = store::data_dir();
+    let mut cache = Cache::open(&dir);
+    let key = cache_key(&llm, mode.as_str(), &ctx, query);
+    let use_cache = !args.fresh && piped.is_none();
+    let cached = use_cache
+        .then(|| cache.get(&key))
+        .flatten()
+        .and_then(|v| serde_json::from_str::<Suggestion>(v).ok());
 
-    let context = ShellContext::detect();
-    let config = Config::load("knock");
-    let cache_key = Cache::generate_key(&args.input, &context.os, &context.shell, mode_str);
-    let cache = Cache::load();
-
-    let res = if let Some(cached) = cache.get(&cache_key) {
-        cached
-    } else {
-        let prompt = gen_prompt(&context, &args.input, mode);
-        let options = RequestOptions {
-            max_tokens: get_max_tokens(mode),
-            temperature: 0.2,
-            model: None,
-        };
-
-        let response = conduit::request(&config, get_instructions(mode), &prompt, options)
-            .await
-            .expect("Error getting response");
-
-        cache.insert(cache_key, response.clone());
-        response
-    };
-
-    // Save to history (only for standard/verbose, not alt)
-    if !args.alt {
-        let history = History::load();
-        // For verbose mode, extract just the command (first line) for history
-        let cmd_for_history = if args.verbose {
-            res.lines().next().unwrap_or(&res).to_string()
-        } else {
-            res.clone()
-        };
-        history.add(args.input.clone(), cmd_for_history);
-    }
-
-    // Display result
-    if args.verbose {
-        // Verbose: command on first line, explanation below
-        let mut lines = res.lines();
-        if let Some(cmd) = lines.next() {
-            println!("{}", cmd.bright_green());
-            // Copy just the command to clipboard
-            copy_to_clipboard(cmd).expect("Error copying to clipboard");
-            // Print remaining lines (explanation) in dimmed style
-            let explanation: String = lines.collect::<Vec<_>>().join("\n");
-            if !explanation.trim().is_empty() {
-                println!("{}", explanation.trim().dimmed());
+    let suggestion = match cached {
+        Some(s) => s,
+        None => {
+            let spinner = Spinner::start("thinking");
+            let result = llm::suggest(&llm, &ctx, query, piped.as_deref(), mode).await;
+            spinner.stop().await;
+            match result {
+                Ok(s) => {
+                    if use_cache && let Ok(json) = serde_json::to_string(&s) {
+                        cache.put(key, json);
+                    }
+                    s
+                }
+                Err(e) => return report(&e),
             }
         }
-    } else {
-        println!("{}", &res.bright_green());
-        if !args.alt {
-            copy_to_clipboard(&res).expect("Error copying to clipboard");
-        }
-    }
-
-    if args.execute && !args.alt {
-        let cmd = if args.verbose {
-            res.lines().next().unwrap_or(&res)
-        } else {
-            &res
-        };
-        print!("{}", "Execute? [y/N] ".yellow());
-        io::stdout().flush().unwrap();
-
-        let mut input = String::new();
-        io::stdin().lock().read_line(&mut input).unwrap();
-
-        if input.trim().eq_ignore_ascii_case("y") {
-            println!("{}", "---".dimmed());
-            execute_command(cmd);
-        }
-    }
-}
-
-async fn explain_command(command: &str, _args: &Args) {
-    let context = ShellContext::detect();
-    let config = Config::load("knock");
-    let cache_key = Cache::generate_key(command, &context.os, &context.shell, "explain");
-    let cache = Cache::load();
-
-    let res = if let Some(cached) = cache.get(&cache_key) {
-        cached
-    } else {
-        let prompt = gen_prompt(&context, command, RequestMode::Explain);
-        let options = RequestOptions {
-            max_tokens: get_max_tokens(RequestMode::Explain),
-            temperature: 0.2,
-            model: None,
-        };
-
-        let response = conduit::request(&config, get_instructions(RequestMode::Explain), &prompt, options)
-            .await
-            .expect("Error getting response");
-
-        cache.insert(cache_key, response.clone());
-        response
     };
+    History::open(&dir).add(query, &suggestion.command);
 
-    println!("{}", command.bright_green());
-    println!();
-    println!("{}", res);
+    if args.raw || !std::io::stdout().is_terminal() {
+        if suggestion.dangerous {
+            ui::warn_dangerous();
+        }
+        println!("{}", suggestion.command);
+        return ExitCode::SUCCESS;
+    }
+
+    print_suggestion(&suggestion);
+    if !args.no_copy && ui::copy(&suggestion.command) && !args.execute {
+        eprintln!("{}", "copied to clipboard".dimmed());
+    }
+    if args.execute {
+        let question = if suggestion.dangerous {
+            format!("{} ", "Run it anyway? [y/N]".red().bold())
+        } else {
+            format!("{} ", "Run it? [y/N]".yellow())
+        };
+        if ui::confirm(&question) {
+            eprintln!("{}", "---".dimmed());
+            return ui::execute(&suggestion.command);
+        }
+    }
+    ExitCode::SUCCESS
 }
 
-fn show_history(filter: &str) {
-    let history = History::load();
-    let entries = if filter.is_empty() {
+fn print_suggestion(s: &Suggestion) {
+    println!("{}", s.command.bright_green());
+    if let Some(explanation) = s.explanation.as_deref().filter(|e| !e.trim().is_empty()) {
+        println!("\n{}", explanation.trim().dimmed());
+    }
+    if !s.alternatives.is_empty() {
+        println!("\n{}", "alternatives".dimmed());
+        for (i, alt) in s.alternatives.iter().enumerate() {
+            println!("  {}. {}", i + 1, alt.command.green());
+            println!("     {}", alt.note.dimmed());
+        }
+    }
+    if s.dangerous {
+        ui::warn_dangerous();
+    }
+}
+
+async fn explain(args: &Args, command: &str) -> ExitCode {
+    let ctx = ShellContext::detect();
+    let llm = match llm::connect(args.provider.as_deref(), args.model.as_deref()) {
+        Ok(llm) => llm,
+        Err(e) => return report(&e),
+    };
+    let mut cache = Cache::open(&store::data_dir());
+    let key = cache_key(&llm, "explain", &ctx, command);
+    let cached = (!args.fresh)
+        .then(|| cache.get(&key).map(str::to_string))
+        .flatten();
+
+    let text = match cached {
+        Some(text) => text,
+        None => {
+            let spinner = Spinner::start("reading");
+            let result = llm::explain(&llm, &ctx, command).await;
+            spinner.stop().await;
+            match result {
+                Ok(text) => {
+                    cache.put(key, text.clone());
+                    text
+                }
+                Err(e) => return report(&e),
+            }
+        }
+    };
+    println!("{}\n\n{}", command.bright_green(), text);
+    ExitCode::SUCCESS
+}
+
+fn cache_key(llm: &Conduit, mode: &str, ctx: &ShellContext, input: &str) -> String {
+    let provider = llm.provider();
+    Cache::key(&[
+        mode,
+        &provider.name,
+        provider.model.as_deref().unwrap_or_default(),
+        &ctx.os,
+        &ctx.shell,
+        input,
+    ])
+}
+
+fn show_history(term: &str) {
+    let history = History::open(&store::data_dir());
+    let entries = if term.is_empty() {
         history.recent(20)
     } else {
-        history.search(filter)
+        history.search(term)
     };
-
     if entries.is_empty() {
         println!("{}", "No history found.".dimmed());
-        return;
     }
-
-    for entry in entries.iter() {
+    for entry in entries {
         println!("{}", entry.query.dimmed());
         println!("  {}", entry.command.bright_green());
     }
 }
 
-fn execute_command(cmd: &str) {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-
-    let status = Command::new(&shell)
-        .arg("-c")
-        .arg(cmd)
-        .status();
-
-    match status {
-        Ok(s) if !s.success() => {
-            if let Some(code) = s.code() {
-                eprintln!("{}", format!("Command exited with code {}", code).red());
-            }
+fn report(e: &conduit::Error) -> ExitCode {
+    use conduit::Error;
+    eprintln!("{} {e}", "error:".red().bold());
+    let hint = match e {
+        Error::MissingModel { .. }
+        | Error::MissingApiKey { .. }
+        | Error::UnknownProvider(_)
+        | Error::Config { .. }
+        | Error::CommandNotFound { .. }
+        | Error::Unauthorized { .. }
+        | Error::ModelNotFound { .. } => Some("run `kn --config` to choose a provider and model"),
+        Error::Truncated { .. } | Error::Empty { .. } => {
+            Some("try again, or pick another model with --model")
         }
-        Err(e) => eprintln!("{}", format!("Failed to execute: {}", e).red()),
-        _ => {}
+        Error::Json { raw, .. } => {
+            eprintln!("{}", raw.trim().dimmed());
+            Some(
+                "the model didn't return a usable command; try again or pick another model with --model",
+            )
+        }
+        _ => None,
+    };
+    if let Some(hint) = hint {
+        eprintln!("  {}", hint.dimmed());
     }
-}
-
-fn copy_to_clipboard(text: &str) -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(target_os = "macos")]
-    let cmd = "pbcopy";
-
-    #[cfg(target_os = "linux")]
-    let cmd = "wl-copy";
-
-    let mut child = Command::new(cmd).stdin(Stdio::piped()).spawn()?;
-
-    child.stdin.as_mut().unwrap().write_all(text.as_bytes())?;
-    child.wait()?;
-    Ok(())
-}
-
-const REPO_URL: &str = "https://github.com/michaelyang12/knock.git";
-const CARGO_TOML_URL: &str = "https://raw.githubusercontent.com/michaelyang12/knock/master/Cargo.toml";
-const LOCAL_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-fn get_remote_version() -> Option<String> {
-    let output = Command::new("curl")
-        .args(["-sL", CARGO_TOML_URL])
-        .output()
-        .ok()?;
-
-    if !output.status.success() {
-        return None;
-    }
-
-    let content = String::from_utf8(output.stdout).ok()?;
-    for line in content.lines() {
-        if line.starts_with("version") {
-            let version = line
-                .split('=')
-                .nth(1)?
-                .trim()
-                .trim_matches('"');
-            return Some(version.to_string());
-        }
-    }
-    None
-}
-
-fn upgrade() {
-    println!("{}", "Checking for updates...".cyan());
-
-    match get_remote_version() {
-        Some(remote_version) if remote_version == LOCAL_VERSION => {
-            println!(
-                "{}",
-                format!("Already up to date (v{}).", LOCAL_VERSION).green()
-            );
-            return;
-        }
-        Some(remote_version) => {
-            println!(
-                "{}",
-                format!("Upgrading from v{} to v{}...", LOCAL_VERSION, remote_version).cyan()
-            );
-        }
-        None => {
-            println!("{}", "Could not check remote version, upgrading anyway...".yellow());
-        }
-    }
-
-    let status = Command::new("cargo")
-        .args(["install", "--git", REPO_URL, "--locked", "--force"])
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            println!("{}", "Upgrade complete!".green());
-        }
-        Ok(_) => {
-            eprintln!("{}", "Upgrade failed".red());
-        }
-        Err(e) => {
-            eprintln!("{}", format!("Failed to run cargo: {}", e).red());
-        }
-    }
+    ExitCode::FAILURE
 }
